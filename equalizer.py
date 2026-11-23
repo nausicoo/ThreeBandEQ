@@ -41,9 +41,25 @@ Key takeaways:
 - The slight overshoot above 0.3000 is caused by IIR filter boundary transients
   (edge ringing) during forward-backward filtering.
 
-Next steps:
-- Perform listening tests on the exported band WAV files and complete a
-  line-by-line review of `split_bands()`.
+Day 4: dB Gain scaling, band recombination & clipping protection
+
+Added decibel-to-linear amplitude conversion (`db_to_linear()`), vectorized band
+mixing with automatic clipping protection (`apply_eq()`), and WAV export
+(`export_audio()`).
+
+Key takeaways:
+- Human loudness perception is logarithmic, so EQ gains in dB are converted to
+  linear amplitude multipliers via g = 10^(dB / 20) (e.g., +6 dB ≈ 1.9953x,
+  +12 dB ≈ 3.9811x, -24 dB ≈ 0.0631x).
+- Flat-response test (0 dB across all bands) reconstructed the signal with a
+  0.8870 peak vs. the original 0.8634, confirming phase-coherent recombination
+  with minor IIR edge-transient buildup.
+- Moderate EQ test (+6 dB Low, -24 dB Mid, 0 dB High) produced a safe 0.9285
+  peak without triggering clipping protection.
+- Stress test (+12 dB Low, -24 dB Mid, 0 dB High) pushed the raw summed peak
+  to 1.5493, successfully triggering automatic proportional peak scaling
+  (factor: 0.6390) to bring the exported peak down to 0.9900 without hard
+  digital clipping or altering relative band balance.
 
 """
 
@@ -64,6 +80,7 @@ class ThreeBandEqualizer:
         self.low_band = None # Initialize low_band to None; it will hold the low-frequency band after filtering
         self.mid_band = None # The same applies to mid_band and high_band, which will hold the mid and high-frequency bands after filtering
         self.high_band = None
+        self.processed_audio = None # Initialize processed_audio to None; it will hold the final equalized audio signal after applying EQ settings
 
     def load_audio(self) -> bool:
         """Loads a WAV file into a Numpy array and stores signal data."""
@@ -144,13 +161,82 @@ class ThreeBandEqualizer:
         print(f"Mid band peak:  {float(np.max(np.abs(self.mid_band))):.4f}")
         print(f"High band peak: {float(np.max(np.abs(self.high_band))):.4f}")
 
+    @staticmethod
+    def db_to_linear(db: float) -> float:
+        """Converts decibels (dB) to a linear amplitude multiplier."""
+        # This method converts a gain value in decibels (dB) to a linear amplitude multiplier.
+        # The formula used is 10^(db/20), which is derived from the logarithmic relationship between decibels and linear amplitude.
+        # This conversion is necessary because audio processing often requires linear gain values for mathematical operations,
+        # while user interfaces and specifications commonly use decibel values for their logarithmic representation of sound intensity.
+        return 10.0 ** (db / 20.0)
+
+    def apply_eq( # This method applies the equalization settings to the separated frequency bands.
+            # It takes gain values in decibels for the low, mid, and high bands, converts them to linear multipliers, and then combines the bands back into a single audio signal.
+            # It also includes an option to prevent clipping by scaling down the signal if the peak amplitude exceeds 1.0.
+            self,
+            low_db: float = 0.0, # The default gain for the low band is set to 0.0 dB, meaning no change in amplitude.
+            # The user can specify a different gain value in decibels to boost or cut the high, mid, and low frequencies.
+            mid_db: float = 0.0,
+            high_db: float = 0.0,
+            prevent_clipping: bool = True, # The prevent_clipping parameter is a boolean flag that determines whether the method should automatically scale down the combined audio signal to prevent clipping.
+            # If set to True, the method will check the peak amplitude of the mixed signal and scale it down if it exceeds 1.0, ensuring that the output remains within the safe range for audio signals.
+    ):
+        """Applies dB gains to each band, recombines them, and protects against clipping."""
+        if self.low_band is None or self.mid_band is None or self.high_band is None:
+            print("Bands not split yet. Call split_bands() first.") # If any of the frequency bands (low, mid, or high) have not been split yet (they are still None),
+            # it means that the user has not called the split_bands() method to separate the audio into its respective frequency bands.
+            # In this case, the method prints a message indicating that the user should call split_bands() first before applying equalization,
+            # and then it returns early without making any changes to the audio signal.
+            return
+
+        low_gain = self.db_to_linear(low_db) # This line converts the gain value for the low band from decibels to a linear amplitude multiplier using the db_to_linear() method.
+        mid_gain = self.db_to_linear(mid_db)
+        high_gain = self.db_to_linear(high_db)
+
+        mixed = (
+                (self.low_band * low_gain)
+                + (self.mid_band * mid_gain)
+                + (self.high_band * high_gain)
+        ) # This line combines the three frequency bands (low, mid, and high) into a single audio signal by applying the respective linear gain multipliers to each band and summing them together.
+
+        raw_peak = float(np.max(np.abs(mixed))) # This line calculates the peak amplitude of the mixed audio signal by taking the maximum absolute value of the combined signal.
+        # It converts the result to a float for consistent formatting and further processing.
+
+        if prevent_clipping and raw_peak > 1.0: # If the prevent_clipping flag is set to True and the raw peak amplitude of the mixed signal exceeds 1.0,
+            # it indicates that the audio signal is at risk of clipping (distortion due to exceeding the maximum amplitude range).
+            scale_factor = 0.99 / raw_peak
+            mixed = mixed * scale_factor
+            print(
+                f"\n[Clipping protection] Raw peak ({raw_peak:.4f}) exceeded 1.0. "
+                f"Scaled down to 0.9900 (factor: {scale_factor:.4f})."
+            )
+
+        self.processed_audio = mixed
+        final_peak = float(np.max(np.abs(self.processed_audio))) # This line calculates the peak amplitude of the processed audio signal after applying equalization and any necessary clipping protection.
+        # It takes the maximum absolute value of the processed audio array and converts it to a float for consistent formatting and further processing.
+
+        print(f"\n--- EQ Applied (Low: {low_db:+.1f} dB, Mid: {mid_db:+.1f} dB, High: {high_db:+.1f} dB) ---")
+        print(f"Linear gains -> Low: {low_gain:.4f}x | Mid: {mid_gain:.4f}x | High: {high_gain:.4f}x")
+        print(f"Final mixed peak: {final_peak:.4f}")
+
+    def export_audio(self, output_path: str):
+        """Exports the equalized audio array to a WAV file."""
+        if self.processed_audio is None:
+            print("No processed audio to export. Call apply_eq() first.")
+            return
+
+        sf.write(output_path, self.processed_audio, self.sample_rate) # This line uses the soundfile library to write the processed audio data to a WAV file at the specified output path.
+        print(f"Exported equalized audio to '{output_path}'")
+
 if __name__ == "__main__":
     eq = ThreeBandEqualizer("test_signal.wav")
-    if eq.load_audio(): # If the audio file is loaded successfully, we proceed to inspect the signal and split it into frequency bands.
-        eq.inspect_signal() # Prints core mathematical properties of the loaded audio signal, such as sample rate, channels, duration, and peak amplitude. This helps verify that the audio file has been loaded correctly and provides useful information for further processing.
+    if eq.load_audio():
+        eq.inspect_signal()
         eq.split_bands(low_cutoff=250.0, high_cutoff=3000.0, order=4)
 
-        # Save separated bands to verify them by ear (ignored by .gitignore because of *.wav)
-        sf.write("band_low.wav", eq.low_band, eq.sample_rate)
-        sf.write("band_mid.wav", eq.mid_band, eq.sample_rate)
-        sf.write("band_high.wav", eq.high_band, eq.sample_rate)
+        # Test 1: Flat response check (all bands at 0 dB should reconstruct the original signal)
+        eq.apply_eq(low_db=0.0, mid_db=0.0, high_db=0.0)
+
+        # Test 2: Actual EQ curve (boost lows, heavily cut mids, keep highs neutral)
+        eq.apply_eq(low_db=12.0, mid_db=-24.0, high_db=0.0)
+        eq.export_audio("output_eq_test.wav")
